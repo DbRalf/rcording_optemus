@@ -2,6 +2,7 @@
 #include <gst/rtsp/gstrtspurl.h>
 #include <iostream>
 #include <memory>
+#include <sys/statvfs.h>
 
 
 static gchar * on_format_location(GstElement *, guint fragment, gpointer user_data)
@@ -146,6 +147,17 @@ GstElement * build_recording_pipeline(const std::string &feed_name, const std::s
 }   
 
 
+static const uint64_t MIN_FREE_BYTES = 10ULL * 1024 * 1024 * 1024; // 10 GB
+
+static uint64_t free_bytes(const std::string &path)
+{
+    struct statvfs st;
+    if (statvfs(path.c_str(), &st) != 0)
+        return 0;
+    return (uint64_t)st.f_bavail * st.f_frsize;
+}
+
+
 struct PipelineCtx {
     GstElement *pipeline;
     GMainLoop  *loop;
@@ -191,20 +203,63 @@ static gboolean bus_callback(GstBus *bus, GstMessage *msg, gpointer data)
 }
 
 
+struct DiskMonitorCtx {
+    std::string   path;
+    GstElement  **pipelines;
+    int           pipeline_count;
+    GMainLoop    *loop;
+};
+
+static gboolean disk_monitor_cb(gpointer data)
+{
+    DiskMonitorCtx *ctx = (DiskMonitorCtx *)data;
+    uint64_t avail = free_bytes(ctx->path);
+    if (avail < MIN_FREE_BYTES) {
+        g_printerr("[disk] WARNING: only %.1f GB free on %s — stopping all pipelines.\n",
+                   avail / (1024.0 * 1024.0 * 1024.0), ctx->path.c_str());
+        for (int i = 0; i < ctx->pipeline_count; i++)
+            if (ctx->pipelines[i])
+                gst_element_set_state(ctx->pipelines[i], GST_STATE_NULL);
+        g_main_loop_quit(ctx->loop);
+        return G_SOURCE_REMOVE;
+    }
+    g_print("[disk] %.1f GB free on %s\n", avail / (1024.0 * 1024.0 * 1024.0), ctx->path.c_str());
+    return G_SOURCE_CONTINUE;
+}
+
+
 int main(int argc, char * argv[])
 {
     gst_init(&argc, &argv);
 
-    // build timestamped output directory tree
+    if (argc < 2) {
+        g_printerr("Usage: %s <output-path>\n  Example: %s /mnt/ssd\n", argv[0], argv[0]);
+        return -1;
+    }
+    std::string base_path(argv[1]);
+
+    // pre-run disk space check
+    {
+        uint64_t avail = free_bytes(base_path);
+        if (avail < MIN_FREE_BYTES) {
+            g_printerr("[disk] only %.1f GB free on %s — need at least 10 GB. Aborting.\n",
+                       avail / (1024.0 * 1024.0 * 1024.0), base_path.c_str());
+            return -1;
+        }
+        g_print("[disk] %.1f GB free on %s — OK\n", avail / (1024.0 * 1024.0 * 1024.0), base_path.c_str());
+    }
+
+    // build timestamped output directory tree - change in the future to incluse GNSS timestamp
     GDateTime *dt = g_date_time_new_now_local();
     gchar *ts = g_date_time_format(dt, "%Y%m%d_%H%M%S");
     g_date_time_unref(dt);
 
+    // creating pipelines
     std::string dirs[4] = {
-        std::string(ts) + "/front/rgb",
-        std::string(ts) + "/rear/rgb",
-        std::string(ts) + "/front/thermal",
-        std::string(ts) + "/rear/thermal",
+        base_path + "/" + ts + "/front/rgb",
+        base_path + "/" + ts + "/rear/rgb",
+        base_path + "/" + ts + "/front/thermal",
+        base_path + "/" + ts + "/rear/thermal",
     };
     g_free(ts);
 
@@ -218,20 +273,16 @@ int main(int argc, char * argv[])
         build_recording_pipeline("thermal_back",  "rtsp://127.0.0.1:8554/stream0/ch4", dirs[3]),
     };
 
-    for (int i = 0; i < 4; i++) {
-        if (!pipelines[i]) {
-            g_printerr("Failed to build pipeline %d\n", i);
-            return -1;
-        }
-    }
-
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     int active_count = 0;
     PipelineCtx ctxs[4];
 
     g_print("[main] starting pipelines...\n");
     for (int i = 0; i < 4; i++) {
-        if (!pipelines[i]) continue;
+        if (!pipelines[i]) {
+            g_printerr("[main] pipeline %d failed to build, skipping\n", i);
+            continue;
+        }
         ctxs[i] = { pipelines[i], loop, &active_count };
         GstBus *bus = gst_element_get_bus(pipelines[i]);
         gst_bus_add_watch(bus, bus_callback, &ctxs[i]);
@@ -246,6 +297,9 @@ int main(int argc, char * argv[])
         return -1;
     }
     g_print("[main] %d pipeline(s) waiting for streams...\n", active_count);
+
+    DiskMonitorCtx disk_ctx = { base_path, pipelines, 4, loop };
+    g_timeout_add_seconds(600, disk_monitor_cb, &disk_ctx);
 
     g_main_loop_run(loop);
 

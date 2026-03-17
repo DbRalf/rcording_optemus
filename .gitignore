@@ -19,3 +19,15 @@ recorder
 
 # ffmpeg concat lists
 concat_list.txt
+
+# VSCode IntelliSense cache
+.vscode/
+
+# Video files
+*.mp4
+thermal_cam
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
